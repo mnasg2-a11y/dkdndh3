@@ -1,74 +1,0 @@
-name: Persistent-VPS
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
-
-jobs:
-  secure-vps:
-    runs-on: ubuntu-latest
-    timeout-minutes: 0
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-
-      - name: Restore Data
-        run: |
-          mkdir -p $HOME/my_data
-          echo "✅ تم إنشاء دليل البيانات"
-
-      - name: Create SSH User & Configure
-        run: |
-          sudo apt update -y
-          sudo apt install -y openssh-server
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
-          
-          # إنشاء مستخدم جديد مع صلاحيات sudo
-          sudo useradd -m -s /bin/bash githubuser
-          echo "githubuser:GitHubVPS2024" | sudo chpasswd
-          sudo usermod -aG sudo githubuser
-          
-          # إعدادات SSH أكثر أماناً
-          echo "PermitRootLogin no" | sudo tee -a /etc/ssh/sshd_config
-          echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
-          echo "AllowUsers githubuser" | sudo tee -a /etc/ssh/sshd_config
-          
-          sudo service ssh restart
-          echo "✅ SSH user: githubuser | pass: GitHubVPS2024"
-
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=persistent-vps --advertise-exit-node
-          tsIP=$(tailscale ip -4 | head -n 1)
-          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          echo "✅ Tailscale IP: $tsIP"
-
-      - name: Keep VPS Alive Forever
-        run: |
-          echo "========================================="
-          echo "🚀 VPS جاهز للاستخدام!"
-          echo "📡 Tailscale IP: $TAILSCALE_IP"
-          echo "🖥️  SSH: githubuser@$TAILSCALE_IP"
-          echo "🔑 كلمة المرور: GitHubVPS2024"
-          echo "🔐 للمستخدم صلاحيات sudo كاملة"
-          echo "========================================="
-          echo ""
-          echo "✅ استخدم الأمر التالي للاتصال:"
-          echo "ssh githubuser@$TAILSCALE_IP"
-          echo ""
-          echo "📝 بعد الاتصال، يمكنك التحقق باستخدام:"
-          echo "whoami  # يجب أن يظهر: githubuser"
-          echo "sudo -l  # لعرض صلاحيات sudo"
-          echo ""
-          echo "[$(date)] بدء التشغيل..."
-          
-          # حلقة لا نهائية
-          while true; do
-            echo "[$(date)] VPS نشط - IP: $TAILSCALE_IP"
-            echo "   📍 للاتصال: ssh githubuser@$TAILSCALE_IP"
-            echo "   🔐 كلمة المرور: GitHubVPS2024"
-            echo "   ---------------------------------"
-            sleep 300  # تحديث كل 5 دقائق
-          done
