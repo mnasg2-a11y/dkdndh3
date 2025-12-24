@@ -1,138 +1,0 @@
-name: Persistent-VPS
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
-
-jobs:
-  secure-vps:
-    runs-on: ubuntu-latest
-    timeout-minutes: 0
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-
-      - name: Restore Data
-        run: |
-          git config --global user.name "VPS-Bot"
-          git config --global user.email "bot@vps.com"
-          mkdir -p ~/my_data
-
-      - name: Install & Configure SSH
-        run: |
-          sudo apt update -y
-          sudo apt install -y openssh-server net-tools
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
-          
-          # تغيير كلمة مرور root
-          echo "root:GitHubSecure123!" | sudo chpasswd
-          
-          # إعدادات SSH أكثر أماناً
-          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          
-          # إضافة إعدادات Tailscale
-          echo "AcceptEnv TAILSCALE_IP" | sudo tee -a /etc/ssh/sshd_config
-          echo "AllowTcpForwarding yes" | sudo tee -a /etc/ssh/sshd_config
-          
-          sudo systemctl restart ssh
-          
-          # التحقق من حالة SSH
-          echo "✅ SSH Status:"
-          sudo systemctl status ssh --no-pager
-          echo "✅ SSH Listening on:"
-          sudo netstat -tlnp | grep ssh
-
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          
-          # تشغيل Tailscale مع إعدادات متقدمة
-          sudo tailscale up \
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=github-vps-${{ github.run_id }} \
-            --advertise-exit-node \
-            --accept-dns=false \
-            --accept-routes
-          
-          # الحصول على IP والتحقق منه
-          tsIP=$(tailscale ip -4 | head -n 1)
-          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          
-          # التحقق من حالة Tailscale
-          echo "✅ Tailscale Status:"
-          tailscale status
-          echo "✅ Tailscale IP: $tsIP"
-          
-          # فتح جدار الحماية للـ SSH
-          sudo ufw allow 22/tcp
-          echo "✅ Firewall: Port 22 opened for SSH"
-
-      - name: Configure Network & Test Connection
-        run: |
-          echo "🔧 Configuring network settings..."
-          
-          # تمكين IP forwarding
-          sudo sysctl -w net.ipv4.ip_forward=1
-          echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
-          
-          # عرض معلومات الشبكة
-          echo "📡 Network Information:"
-          ip addr show tailscale0 || echo "Tailscale interface not found"
-          
-          # اختبار الاتصال الداخلي
-          echo "🔍 Testing internal SSH connection..."
-          if sudo systemctl is-active --quiet ssh; then
-            echo "✅ SSH service is running"
-            
-            # اختبار الاتصال المحلي
-            if timeout 5 bash -c "echo > /dev/tcp/localhost/22"; then
-              echo "✅ SSH is listening on localhost:22"
-            else
-              echo "❌ SSH is NOT listening on localhost:22"
-            fi
-          else
-            echo "❌ SSH service is NOT running"
-          fi
-
-      - name: Keep VPS Alive Forever
-        run: |
-          echo "========================================="
-          echo "🚀 VPS جاهز للاستخدام!"
-          echo "========================================="
-          echo "📡 Tailscale IP: $TAILSCALE_IP"
-          echo "🖥️  SSH Connection: ssh root@$TAILSCALE_IP"
-          echo "🔑 Password: GitHubSecure123!"
-          echo "========================================="
-          echo ""
-          echo "📝 خطوات الاتصال:"
-          echo "1. تأكد من أنك متصل بنفس شبكة Tailscale"
-          echo "2. استخدم الأمر: ssh root@$TAILSCALE_IP"
-          echo "3. أدخل كلمة المرور: GitHubSecure123!"
-          echo ""
-          echo "🔍 للتحقق من الاتصال:"
-          echo "ping $TAILSCALE_IP"
-          echo ""
-          echo "[$(date)] بدء التشغيل..."
-          
-          # حلقة لا نهائية مع معلومات تفصيلية
-          counter=1
-          while true; do
-            echo ""
-            echo "⏰ [$(date)] VPS يعمل بدون توقف... (الدقيقة: $counter)"
-            echo "📍 Tailscale IP: $TAILSCALE_IP"
-            echo "🔌 SSH: ssh root@$TAILSCALE_IP"
-            echo "🔐 Password: GitHubSecure123!"
-            
-            # التحقق من الخدمات كل 10 دقائق
-            if (( counter % 10 == 0 )); then
-              echo ""
-              echo "🔍 فحص الخدمات:"
-              echo "SSH Status: $(sudo systemctl is-active ssh)"
-              echo "Tailscale Status: $(tailscale status | head -1)"
-            fi
-            
-            sleep 60
-            counter=$((counter + 1))
-          done
