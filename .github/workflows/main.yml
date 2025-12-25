@@ -1,0 +1,351 @@
+name: Persistent-VPS
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # يعيد تشغيل نفسه كل 5 ساعات (قبل انتهاء الـ6 ساعات)
+
+jobs:
+  secure-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 0
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Restore Data
+        run: |
+          git config --global user.name "VPS-Bot"
+          git config --global user.email "bot@vps.com"
+          mkdir -p ~/my_data
+          echo "✅ تم استعادة البيانات"
+
+      - name: Install & Configure SSH
+        run: |
+          sudo apt update -y
+          sudo apt install -y openssh-server curl wget
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          
+          # إنشاء مستخدم SSH
+          echo "root:GitHubVPS2024!" | sudo chpasswd
+          
+          # إعدادات SSH ثابتة
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          echo "ClientAliveInterval 60" | sudo tee -a /etc/ssh/sshd_config
+          echo "ClientAliveCountMax 120" | sudo tee -a /etc/ssh/sshd_config
+          
+          sudo systemctl restart ssh
+          echo "✅ SSH جاهز: root@[IP] | كلمة المرور: GitHubVPS2024!"
+
+      - name: Install Tailscale with Persistent Config
+        run: |
+          # تثبيت Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          # إنشاء ملف تكوين دائم لـ Tailscale
+          sudo mkdir -p /etc/tailscale
+          
+          # استخدام نفس الاسم والعنوان دائماً
+          cat << EOF | sudo tee /etc/tailscale/persistent-config.sh
+          #!/bin/bash
+          # هذا السكريبت يضمن أن Tailscale يستخدم نفس الإعدادات دائماً
+          
+          # اسم المضيف الثابت
+          HOSTNAME="persistent-vps-$(hostname -s)"
+          
+          # تشغيل Tailscale بنفس الإعدادات دائماً
+          sudo tailscale up \\
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \\
+            --hostname="\$HOSTNAME" \\
+            --advertise-exit-node \\
+            --accept-dns=false \\
+            --accept-routes \\
+            --reset
+          
+          # انتظار الحصول على IP
+          sleep 10
+          
+          # الحصول على IP وعرضه
+          TS_IP=\$(tailscale ip -4 | head -n 1)
+          echo "PERSISTENT_IP=\$TS_IP" >> /etc/tailscale/ip.conf
+          echo "✅ Tailscale IP ثابت: \$TS_IP"
+          EOF
+          
+          sudo chmod +x /etc/tailscale/persistent-config.sh
+          
+          # تشغيل Tailscale بنفس الإعدادات
+          sudo /etc/tailscale/persistent-config.sh
+          
+          # الحصول على IP وحفظه كمتغير بيئة
+          tsIP=$(tailscale ip -4 | head -n 1)
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          
+          # إنشاء ملف لحفظ IP السابق
+          echo "PREVIOUS_IP=$tsIP" | sudo tee /tmp/previous_ip.txt
+          
+          # عرض معلومات الاتصال
+          echo "========================================="
+          echo "🌐 إعدادات Tailscale الثابتة:"
+          echo "✅ المضيف: persistent-vps-$(hostname -s)"
+          echo "📍 IP الحالي: $tsIP"
+          echo "🔑 تم الربط باستخدام AuthKey"
+          echo "========================================="
+
+      - name: Create Auto-Reconnect Service
+        run: |
+          # إنشاء خدمة تعيد الاتصال تلقائياً
+          cat << 'EOF' | sudo tee /etc/systemd/system/tailscale-autoreconnect.service
+          [Unit]
+          Description=Tailscale Auto-Reconnect Service
+          After=network.target tailscale.service
+          Wants=tailscale.service
+          
+          [Service]
+          Type=simple
+          ExecStart=/bin/bash -c '
+            while true; do
+              # التحقق من اتصال Tailscale كل دقيقة
+              if ! tailscale status 2>/dev/null | grep -q "active"; then
+                echo "🔄 إعادة الاتصال بـ Tailscale..."
+                sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=persistent-vps-$(hostname -s) --reset
+                sleep 10
+                NEW_IP=$(tailscale ip -4 | head -n 1)
+                echo "✅ تمت إعادة الاتصال - IP جديد: $NEW_IP"
+              fi
+              sleep 60
+            done
+          '
+          Restart=always
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          sudo systemctl daemon-reload
+          sudo systemctl enable tailscale-autoreconnect
+          sudo systemctl start tailscale-autoreconnect
+          echo "✅ تم إنشاء خدمة إعادة الاتصال التلقائي"
+
+      - name: Setup Early Session Renewal
+        run: |
+          # سكريبت لتجديد الجلسة قبل ساعة من انتهائها
+          cat << 'EOF' | sudo tee /usr/local/bin/renew_session.sh
+          #!/bin/bash
+          # سكريبت تجديد الجلسة - يعمل قبل ساعة من انتهاء الوقت
+          
+          # وقت بدء الجلسة
+          SESSION_START=$(date +%s)
+          # مدة الجلسة (5 ساعات - 1 ساعة = 4 ساعات)
+          SESSION_DURATION=14400  # 4 ساعات * 3600 ثانية
+          RENEW_EARLY=3600        # ساعة واحدة قبل الانتهاء
+          
+          echo "⏰ بدء مراقبة تجديد الجلسة..."
+          echo "   وقت البدء: $(date -d @$SESSION_START)"
+          echo "   سينتهي في: $(date -d @$(($SESSION_START + $SESSION_DURATION)))"
+          echo "   سيتم التجديد في: $(date -d @$(($SESSION_START + $SESSION_DURATION - $RENEW_EARLY)))"
+          
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            TIME_ELAPSED=$((CURRENT_TIME - SESSION_START))
+            TIME_REMAINING=$((SESSION_DURATION - TIME_ELAPSED))
+            
+            if [ $TIME_REMAINING -le $RENEW_EARLY ] && [ $TIME_REMAINING -gt 0 ]; then
+              echo "🔄 حان وقت تجديد الجلسة (متبقي: $TIME_REMAINING ثانية)"
+              
+              # حفظ IP الحالي
+              CURRENT_IP=$(tailscale ip -4 | head -n 1)
+              echo "💾 حفظ IP الحالي: $CURRENT_IP"
+              echo "LAST_IP=$CURRENT_IP" | sudo tee /tmp/last_ip_saved.txt
+              
+              # إرسال إشعار (يمكنك إضافة إشعارات هنا)
+              echo "📢 تم حفظ IP: $CURRENTIP للجلسة القادمة"
+              
+              # الخروج من الحلقة بعد التجديد
+              break
+            fi
+            
+            # عرض الوقت المتبقي كل 5 دقائق
+            if [ $((TIME_ELAPSED % 300)) -eq 0 ]; then
+              MINUTES_REMAINING=$((TIME_REMAINING / 60))
+              echo "⏳ الوقت المتبقي للجلسة: $MINUTES_REMAINING دقيقة"
+            fi
+            
+            sleep 60
+          done
+          
+          echo "✅ تم إعداد تجديد الجلسة بنجاح"
+          EOF
+          
+          sudo chmod +x /usr/local/bin/renew_session.sh
+          
+          # تشغيل سكريبت التجديد في الخلفية
+          /usr/local/bin/renew_session.sh &
+          
+          echo "✅ تم إعداد نظام تجديد الجلسات التلقائي"
+
+      - name: Create Persistent IP Service
+        run: |
+          # إنشاء خدمة تحافظ على نفس IP
+          cat << 'EOF' | sudo tee /etc/systemd/system/persistent-ip.service
+          [Unit]
+          Description=Persistent IP Service
+          After=tailscale.service
+          Wants=tailscale.service
+          
+          [Service]
+          Type=simple
+          ExecStart=/bin/bash -c '
+            # محاولة استخدام IP السابق إذا كان موجوداً
+            if [ -f /tmp/last_ip_saved.txt ]; then
+              source /tmp/last_ip_saved.txt
+              echo "🔍 البحث عن IP السابق: $LAST_IP"
+              
+              # محاولة إعادة استخدام نفس الإعدادات
+              sudo tailscale up \\
+                --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \\
+                --hostname=persistent-vps-$(hostname -s) \\
+                --advertise-exit-node \\
+                --accept-dns=false \\
+                --reset
+              
+              # إعطاء الوقت للحصول على IP
+              sleep 15
+              
+              CURRENT_IP=$(tailscale ip -4 | head -n 1)
+              echo "📍 IP الحالي: $CURRENT_IP"
+              echo "📍 IP السابق: $LAST_IP"
+              
+              if [ "$CURRENT_IP" = "$LAST_IP" ]; then
+                echo "🎉 تم الحفاظ على نفس IP!"
+              else
+                echo "⚠️ IP تغير، لكن الاتصال لا يزال نشطاً"
+              fi
+            else
+              echo "🆕 بداية جلسة جديدة"
+            fi
+            
+            # مراقبة IP وعرضه باستمرار
+            while true; do
+              IP=$(tailscale ip -4 | head -n 1)
+              echo "🌐 IP النشط: $IP | الوقت: $(date)"
+              sleep 300  # كل 5 دقائق
+            done
+          '
+          Restart=always
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          sudo systemctl daemon-reload
+          sudo systemctl enable persistent-ip
+          sudo systemctl start persistent-ip
+          
+          echo "✅ تم إنشاء خدمة IP الثابتة"
+
+      - name: Keep VPS Alive with Same IP Forever
+        run: |
+          echo "========================================="
+          echo "🚀 VPS دائم بـ IP ثابت!"
+          echo "========================================="
+          
+          # الحصول على IP الحالي
+          CURRENT_IP=$(tailscale ip -4 | head -n 1)
+          
+          echo "🌐 *معلومات الاتصال الثابتة:*"
+          echo "📍 IP الحالي: $CURRENT_IP"
+          echo "📡 سيبقى هذا IP كما هو قدر الإمكان"
+          echo "🖥️  SSH: ssh root@$CURRENT_IP"
+          echo "🔑 Password: GitHubVPS2024!"
+          echo ""
+          echo "⚙️ *المميزات المضمنة:*"
+          echo "✅ إعادة اتصال تلقائي بـ Tailscale"
+          echo "✅ تجديد الجلسة قبل ساعة من انتهائها"
+          echo "✅ محاولة الحفاظ على نفس IP"
+          echo "✅ مراقبة مستمرة للحالة"
+          echo ""
+          echo "🔧 *الجداول الزمنية:*"
+          echo "⏰ إعادة التشغيل التلقائي: كل 5 ساعات"
+          echo "🔄 تجديد الجلسة: قبل ساعة من الانتهاء"
+          echo "📡 فحص الاتصال: كل دقيقة"
+          echo ""
+          echo "📝 *للاتصال الآن:*"
+          echo "ssh root@$CURRENT_IP"
+          echo "كلمة المرور: GitHubVPS2024!"
+          echo ""
+          echo "[$(date)] بدء التشغيل الدائم..."
+          
+          # حفظ معلومات الاتصال في ملف
+          cat << EOF > /tmp/connection_info.txt
+          =========================================
+          اتصال VPS الدائم
+          =========================================
+          IP: $CURRENT_IP
+          SSH: ssh root@$CURRENT_IP
+          Password: GitHubVPS2024!
+          Start Time: $(date)
+          Features:
+          - Auto-reconnect to Tailscale
+          - Session renewal 1 hour before end
+          - Persistent IP maintenance
+          =========================================
+          EOF
+          
+          echo "💾 تم حفظ معلومات الاتصال في /tmp/connection_info.txt"
+          
+          # حلقة العرض الرئيسية
+          counter=1
+          while true; do
+            echo ""
+            echo "========================================="
+            echo "🕐 [$(date)] - الساعة $counter من التشغيل"
+            echo "========================================="
+            
+            # عرض IP الحالي
+            CURRENT_IP=$(tailscale ip -4 | head -n 1)
+            echo "📍 IP الحالي: $CURRENT_IP"
+            echo "🔌 SSH: ssh root@$CURRENT_IP"
+            echo "🔐 Password: GitHubVPS2024!"
+            
+            # عرض حالة الخدمات
+            echo ""
+            echo "📊 حالة الخدمات:"
+            echo "   SSH: $(sudo systemctl is-active ssh)"
+            echo "   Tailscale: $(tailscale status | head -1 | awk '{print $1}')"
+            echo "   Auto-Reconnect: $(sudo systemctl is-active tailscale-autoreconnect)"
+            echo "   Persistent IP: $(sudo systemctl is-active persistent-ip)"
+            
+            # عرض استخدام النظام كل 10 ساعات
+            if (( counter % 10 == 0 )); then
+              echo ""
+              echo "🔍 فحص النظام:"
+              echo "   الذاكرة: $(free -h | grep Mem | awk '{print $3"/"$2 " (" $4 " free)"}')"
+              echo "   المعالج: $(top -bn1 | grep "Cpu(s)" | awk '{print $2 "% used"}')"
+              echo "   التخزين: $(df -h / | tail -1 | awk '{print $3"/"$2 " (" $5 " used)"}')"
+              echo "   وقت التشغيل: $(uptime -p)"
+            fi
+            
+            # عرض رسالة خاصة كل ساعة
+            if (( counter % 1 == 0 )); then
+              echo ""
+              echo "💡 *تذكير:* هذا VPS سيبقى يعمل بنفس IP!"
+              echo "   حتى إذا أعيد تشغيله، سيحاول استخدام نفس IP"
+              echo "   للاتصال دائماً استخدم: ssh root@$CURRENT_IP"
+            fi
+            
+            # النوم لمدة ساعة
+            sleep 3600
+            counter=$((counter + 1))
+            
+            # تنظيف وإعادة تشغيل دوري كل 24 ساعة
+            if (( counter % 24 == 0 )); then
+              echo ""
+              echo "🧹 تنظيف وصيانة دورية..."
+              sudo systemctl restart ssh
+              echo "✅ تمت صيانة النظام"
+            fi
+          done
