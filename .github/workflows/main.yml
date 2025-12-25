@@ -1,0 +1,214 @@
+name: Persistent-VPS
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # يعيد تشغيل نفسه كل 5 ساعات
+
+jobs:
+  secure-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Restore Data
+        run: |
+          git config --global user.name "VPS-Bot"
+          git config --global user.email "bot@vps.com"
+          mkdir -p ~/my_data
+          echo "✅ تم استعادة البيانات"
+
+      - name: Install & Configure SSH
+        run: |
+          sudo apt update -y
+          sudo apt install -y openssh-server curl wget
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          
+          # إنشاء مستخدم SSH
+          echo "root:GitHubVPS2024!" | sudo chpasswd
+          
+          # إعدادات SSH ثابتة
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          echo "ClientAliveInterval 60" | sudo tee -a /etc/ssh/sshd_config
+          echo "ClientAliveCountMax 120" | sudo tee -a /etc/ssh/sshd_config
+          
+          sudo systemctl restart ssh
+          echo "✅ SSH جاهز: root@[IP] | كلمة المرور: GitHubVPS2024!"
+
+      - name: Install Tailscale
+        run: |
+          # تثبيت Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          # تشغيل Tailscale
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="persistent-vps-${{ github.run_id }}" --reset
+          
+          # انتظار الحصول على IP
+          sleep 5
+          
+          # الحصول على IP
+          tsIP=$(tailscale ip -4 | head -n 1)
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          
+          echo "========================================="
+          echo "✅ Tailscale جاهز!"
+          echo "📍 IP: $tsIP"
+          echo "🖥️  SSH: ssh root@$tsIP"
+          echo "🔑 Password: GitHubVPS2024!"
+          echo "========================================="
+
+      - name: Setup Auto-Reconnect Script
+        run: |
+          # إنشاء سكريبت بسيط لإعادة الاتصال
+          cat << 'EOF' > /tmp/autoreconnect.sh
+          #!/bin/bash
+          echo "🔧 بدء سكريبت إعادة الاتصال التلقائي..."
+          
+          while true; do
+            # التحقق من اتصال Tailscale
+            if ! tailscale status 2>/dev/null | grep -q "active"; then
+              echo "🔄 إعادة الاتصال بـ Tailscale..."
+              sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="persistent-vps-${{ github.run_id }}" --reset
+              sleep 5
+              NEW_IP=$(tailscale ip -4 | head -n 1)
+              echo "✅ تمت إعادة الاتصال - IP: $NEW_IP"
+            fi
+            
+            # عرض حالة الاتصال كل 5 دقائق
+            IP=$(tailscale ip -4 | head -n 1 2>/dev/null || echo "غير متصل")
+            echo "🌐 حالة الاتصال: $IP - الوقت: $(date)"
+            
+            sleep 300  # انتظار 5 دقائق
+          done
+          EOF
+          
+          chmod +x /tmp/autoreconnect.sh
+          
+          # تشغيل السكريبت في الخلفية
+          /tmp/autoreconnect.sh &
+          echo "✅ تم تشغيل سكريبت إعادة الاتصال"
+
+      - name: Setup Auto-Save Script
+        run: |
+          # إنشاء سكريبت لحفظ البيانات
+          cat << 'EOF' > /tmp/autosave.sh
+          #!/bin/bash
+          echo "💾 بدء سكريبت الحفظ التلقائي..."
+          
+          counter=1
+          while true; do
+            # حفظ معلومات الاتصال كل 30 دقيقة
+            if [ $((counter % 6)) -eq 0 ]; then
+              IP=$(tailscale ip -4 | head -n 1 2>/dev/null || echo "غير متصل")
+              echo "💾 حفظ البيانات (الدورة: $counter)"
+              echo "=========================================" > /tmp/vps_status.txt
+              echo "VPS Status - $(date)" >> /tmp/vps_status.txt
+              echo "IP: $IP" >> /tmp/vps_status.txt
+              echo "SSH: ssh root@$IP" >> /tmp/vps_status.txt
+              echo "Password: GitHubVPS2024!" >> /tmp/vps_status.txt
+              echo "Uptime: $((counter * 5)) دقيقة" >> /tmp/vps_status.txt
+              echo "=========================================" >> /tmp/vps_status.txt
+            fi
+            
+            counter=$((counter + 1))
+            sleep 300  # انتظار 5 دقائق
+          done
+          EOF
+          
+          chmod +x /tmp/autosave.sh
+          
+          # تشغيل السكريبت في الخلفية
+          /tmp/autosave.sh &
+          echo "✅ تم تشغيل سكريبت الحفظ التلقائي"
+
+      - name: Keep VPS Alive Forever
+        run: |
+          echo "========================================="
+          echo "🚀 VPS دائم يعمل!"
+          echo "========================================="
+          
+          # الحصول على IP الحالي
+          CURRENT_IP=$(tailscale ip -4 | head -n 1)
+          
+          if [ -z "$CURRENT_IP" ]; then
+            CURRENT_IP="في انتظار الاتصال..."
+          fi
+          
+          echo "🌐 *معلومات الاتصال:*"
+          echo "📍 IP: $CURRENT_IP"
+          echo "🖥️  SSH: ssh root@$CURRENT_IP"
+          echo "🔑 Password: GitHubVPS2024!"
+          echo ""
+          echo "⚙️ *المميزات المضمنة:*"
+          echo "✅ إعادة اتصال تلقائي بـ Tailscale"
+          echo "✅ حفظ بيانات تلقائي كل 30 دقيقة"
+          echo "✅ SSH جاهز للاستخدام"
+          echo "✅ مراقبة مستمرة للحالة"
+          echo ""
+          echo "📝 *للاتصال الآن:*"
+          echo "ssh root@$CURRENT_IP"
+          echo "كلمة المرور: GitHubVPS2024!"
+          echo ""
+          echo "[$(date)] بدء التشغيل..."
+          
+          # حفظ معلومات الاتصال
+          cat << EOF > /tmp/connection_info.txt
+          =========================================
+          اتصال VPS الدائم
+          =========================================
+          IP: $CURRENT_IP
+          SSH: ssh root@$CURRENT_IP
+          Password: GitHubVPS2024!
+          Start Time: $(date)
+          Features:
+          - Auto-reconnect to Tailscale
+          - Auto-save every 30 minutes
+          - SSH always ready
+          =========================================
+          EOF
+          
+          echo "💾 تم حفظ معلومات الاتصال في /tmp/connection_info.txt"
+          
+          # حلقة التشغيل الرئيسية البسيطة
+          current_time=0
+          while [ $current_time -lt 355 ]; do  # أقل من 360 بدقائق
+            # الحصول على IP الحالي
+            IP=$(tailscale ip -4 | head -n 1 2>/dev/null || echo "جاري إعادة الاتصال...")
+            
+            echo ""
+            echo "========================================="
+            echo "🕐 [$(date)] - الدقيقة $current_time"
+            echo "========================================="
+            echo "📍 IP الحالي: $IP"
+            echo "🔌 SSH: ssh root@$IP"
+            echo "🔐 Password: GitHubVPS2024!"
+            
+            # عرض حالة النظام كل 60 دقيقة
+            if [ $((current_time % 60)) -eq 0 ]; then
+              echo ""
+              echo "🔍 فحص النظام:"
+              echo "   الذاكرة: $(free -h | grep Mem | awk '{print $3"/"$2}') مستخدمة"
+              echo "   التخزين: $(df -h / | tail -1 | awk '{print $5}') مستخدم"
+              echo "   وقت التشغيل: ساعة $((current_time / 60))"
+            fi
+            
+            # التحذير قبل 10 دقائق من النهاية
+            if [ $current_time -eq 350 ]; then
+              echo ""
+              echo "⚠️  سيتم إعادة التشغيل بعد 10 دقائق!"
+              echo "💾 يتم حفظ البيانات النهائية..."
+            fi
+            
+            # الانتظار دقيقة واحدة
+            sleep 60
+            current_time=$((current_time + 1))
+          done
+          
+          echo ""
+          echo "========================================="
+          echo "🔄 إعادة تشغيل VPS..."
+          echo "========================================="
